@@ -147,7 +147,7 @@ static inline int get_wgroup_size(
     int& local_size_col) {
   int maxWGSize = syclMaxWorkGroupSize<KernelClass>();
 
-  int local_size = (dim_size + NUM * vec_size - 1) / (NUM * vec_size);
+  int local_size = (dim_size + vec_size - 1 + NUM * vec_size - 1) / (NUM * vec_size);
   local_size = std::min(local_size, maxWGSize);
   // select the local_size_col to cover the dim_size
   sub_group_num = (local_size + SIMD - 1) / SIMD;
@@ -223,7 +223,8 @@ template <
     typename calc_t,
     typename vec_t,
     bool is_safe_softmax,
-    bool is_same_dtype>
+    bool is_same_dtype,
+    int align_bytes>
 struct DispatchSoftmaxForwardKernelFunctor
     : public __SYCL_KER_CONFIG_CONVENTION__ {
   SYCL_REQD_SUB_GROUP_SIZE(SIMD) void operator()(sycl::nd_item<1> item) const {
@@ -243,34 +244,42 @@ struct DispatchSoftmaxForwardKernelFunctor
     vec_t reg_mask[outer_loop];
     auto lid_offset = lid_col * vec_size;
     auto local_stride = local_size_ * vec_size;
+    int start = ((uint64_t)(in_data_ + group_offset)) % align_bytes
+        / sizeof(inscalar_t);
+    int aligned_dim = dim_size_ + start;
 
-    // load data and get max value
     accscalar_t max_value = std::numeric_limits<accscalar_t>::lowest();
 #pragma unroll(outer_loop)
     for (int i = 0; i < outer_loop; ++i) {
       auto index = i * local_stride + lid_offset;
-      if (index >= dim_size_)
+      if (index >= aligned_dim)
         break;
 
       reg_in[i] =
-          *(reinterpret_cast<const vec_t*>(in_data_ + group_offset + index));
+          *(reinterpret_cast<const vec_t*>(in_data_ + group_offset - start + index));
       if constexpr (is_masked) {
-        auto vec_offset = group_offset + index;
 #pragma unroll(vec_size)
         for (int j = 0; j < vec_size; ++j) {
-          auto linear_idx = vec_offset + j;
-          auto mask_offset = input_calc_.get(linear_idx)[1];
-          reg_mask[i][j] = mask_data_[mask_offset];
+          IndexType linear_idx = index + j - start;
+          if (linear_idx >= 0 && linear_idx < dim_size_) {
+            auto mask_offset = input_calc_.get(group_offset + linear_idx)[1];
+            reg_mask[i][j] = mask_data_[mask_offset];
+          } else {
+            reg_mask[i][j] = true;
+          }
         }
       }
 #pragma unroll(vec_size)
       for (int j = 0; j < vec_size; ++j) {
-        if constexpr (is_masked) {
-          if (reg_mask[i][j]) {
-            reg_in[i][j] = neginf_;
+        IndexType linear_idx = index + j - start;
+        if (linear_idx >= 0 && linear_idx < dim_size_) {
+          if constexpr (is_masked) {
+            if (reg_mask[i][j]) {
+              reg_in[i][j] = neginf_;
+            }
           }
+          max_value = std::max(max_value, accscalar_t(reg_in[i][j]));
         }
-        max_value = std::max(max_value, accscalar_t(reg_in[i][j]));
       }
     }
     if (local_size_ > 1) {
@@ -284,15 +293,18 @@ struct DispatchSoftmaxForwardKernelFunctor
           [](accscalar_t a, accscalar_t b) { return std::max(a, b); });
     }
 
-    // get sum value
     accscalar_t sum_value = 0;
 #pragma unroll(outer_loop)
-    for (int i = 0;
-         i < outer_loop && ((i * local_stride + lid_offset) < dim_size_);
-         ++i) {
+    for (int i = 0; i < outer_loop; ++i) {
+      auto index = i * local_stride + lid_offset;
+      if (index >= aligned_dim)
+        break;
 #pragma unroll(vec_size)
       for (int j = 0; j < vec_size; ++j) {
-        sum_value += sycl::exp(reg_in[i][j] - max_value);
+        IndexType linear_idx = index + j - start;
+        if (linear_idx >= 0 && linear_idx < dim_size_) {
+          sum_value += sycl::exp(accscalar_t(reg_in[i][j]) - max_value);
+        }
       }
     }
     if (local_size_ > 1) {
@@ -310,49 +322,99 @@ struct DispatchSoftmaxForwardKernelFunctor
     else if (sum_value != 0)
       sum_value = accscalar_t(1) / sum_value;
 
-      // update result
+      bool can_vec_store =
+        ((uint64_t)(out_data_ + group_offset - start)) % align_bytes == 0;
+    constexpr int out_vec_size = align_bytes / sizeof(outscalar_t);
+    using out_vec_t =
+        at::native::memory::aligned_vector<outscalar_t, out_vec_size>;
+    constexpr int store_rounds = vec_size / out_vec_size;
+
 #pragma unroll(outer_loop)
     for (int i = 0; i < outer_loop; ++i) {
       auto index = i * local_stride + lid_offset;
-      if (index >= dim_size_)
+      if (index >= aligned_dim)
         break;
-      outscalar_t* out_data_point = out_data_ + group_offset + index;
 
+      bool is_head = (start > 0 && index < vec_size);
+      auto remaining = aligned_dim - index;
+      bool is_tail = (remaining < vec_size);
+
+      if (is_head || is_tail) {
 #pragma unroll(vec_size)
-      for (int j = 0; j < vec_size; ++j) {
-        if constexpr (is_same_dtype) {
-          if constexpr (LogSoftMax) {
-            reg_in[i][j] =
-                static_cast<outscalar_t>(reg_in[i][j] - max_value - sum_value);
-          } else if (
-              is_safe_softmax &&
-              max_value == std::numeric_limits<accscalar_t>::lowest()) {
-            reg_in[i][j] = static_cast<outscalar_t>(0);
-          } else if (sum_value == 0) {
-            reg_in[i][j] = nan_;
-          } else {
-            reg_in[i][j] = static_cast<outscalar_t>(
-                sycl::exp(reg_in[i][j] - max_value) * sum_value);
+        for (int j = 0; j < vec_size; ++j) {
+          IndexType linear_idx = index + j - start;
+          if (linear_idx >= 0 && linear_idx < dim_size_) {
+            outscalar_t result;
+            if constexpr (LogSoftMax) {
+              result = static_cast<outscalar_t>(
+                  accscalar_t(reg_in[i][j]) - max_value - sum_value);
+            } else if (
+                is_safe_softmax &&
+                max_value == std::numeric_limits<accscalar_t>::lowest()) {
+              result = static_cast<outscalar_t>(0);
+            } else if (sum_value == 0) {
+              result = nan_;
+            } else {
+              result = static_cast<outscalar_t>(
+                  sycl::exp(accscalar_t(reg_in[i][j]) - max_value) * sum_value);
+            }
+            out_data_[group_offset + linear_idx] = result;
           }
+        }
+      } else {
+        if constexpr (is_same_dtype) {
+#pragma unroll(vec_size)
+          for (int j = 0; j < vec_size; ++j) {
+            if constexpr (LogSoftMax) {
+              reg_in[i][j] = static_cast<inscalar_t>(
+                  accscalar_t(reg_in[i][j]) - max_value - sum_value);
+            } else if (
+                is_safe_softmax &&
+                max_value == std::numeric_limits<accscalar_t>::lowest()) {
+              reg_in[i][j] = static_cast<inscalar_t>(0);
+            } else if (sum_value == 0) {
+              reg_in[i][j] = nan_;
+            } else {
+              reg_in[i][j] = static_cast<inscalar_t>(
+                  sycl::exp(accscalar_t(reg_in[i][j]) - max_value) * sum_value);
+            }
+          }
+          *(reinterpret_cast<vec_t*>(
+              out_data_ + group_offset - start + index)) = reg_in[i];
         } else {
-          if constexpr (LogSoftMax) {
-            out_data_point[j] =
-                static_cast<outscalar_t>(reg_in[i][j] - max_value - sum_value);
-          } else if (
-              is_safe_softmax &&
-              max_value == std::numeric_limits<accscalar_t>::lowest()) {
-            out_data_point[j] = static_cast<outscalar_t>(0);
-          } else if (sum_value == 0) {
-            out_data_point[j] = static_cast<outscalar_t>(nan_);
+          outscalar_t results[vec_size];
+#pragma unroll(vec_size)
+          for (int j = 0; j < vec_size; ++j) {
+            if constexpr (LogSoftMax) {
+              results[j] = static_cast<outscalar_t>(
+                  accscalar_t(reg_in[i][j]) - max_value - sum_value);
+            } else if (
+                is_safe_softmax &&
+                max_value == std::numeric_limits<accscalar_t>::lowest()) {
+              results[j] = static_cast<outscalar_t>(0);
+            } else if (sum_value == 0) {
+              results[j] = static_cast<outscalar_t>(nan_);
+            } else {
+              results[j] = static_cast<outscalar_t>(
+                  sycl::exp(accscalar_t(reg_in[i][j]) - max_value) * sum_value);
+            }
+          }
+          if (can_vec_store) {
+#pragma unroll(store_rounds)
+            for (int r = 0; r < store_rounds; ++r) {
+              *(reinterpret_cast<out_vec_t*>(
+                  out_data_ + group_offset - start + index +
+                  r * out_vec_size)) =
+                  *(reinterpret_cast<out_vec_t*>(&results[r * out_vec_size]));
+            }
           } else {
-            out_data_point[j] = static_cast<outscalar_t>(
-                sycl::exp(reg_in[i][j] - max_value) * sum_value);
+#pragma unroll(vec_size)
+            for (int j = 0; j < vec_size; ++j) {
+              out_data_[group_offset - start + index + j] = results[j];
+            }
           }
         }
       }
-      if constexpr (is_same_dtype)
-        *(reinterpret_cast<vec_t*>(out_data_ + group_offset + index)) =
-            reg_in[i];
     }
   }
 
@@ -425,7 +487,8 @@ template <
     bool is_masked = false,
     typename calc_t = decltype(nullptr),
     bool is_safe_softmax = false,
-    bool is_same_dtype = false>
+    bool is_same_dtype = false,
+    int align_bytes = alignof(at::native::memory::aligned_vector<inscalar_t, vec_size>)>
 bool dispatch_softmax_forward_kernel(
     const inscalar_t* in_data,
     outscalar_t* out_data,
@@ -439,22 +502,23 @@ bool dispatch_softmax_forward_kernel(
   accscalar_t neginf = -std::numeric_limits<accscalar_t>::infinity();
   accscalar_t nan = std::numeric_limits<accscalar_t>::quiet_NaN();
 
-  if constexpr (is_masked) {
-    using KernelClass = DispatchSoftmaxForwardKernelFunctor<
-        INNER_LOOP,
-        vec_size,
-        SIMD,
-        inscalar_t,
-        outscalar_t,
-        accscalar_t,
-        IndexType,
-        LogSoftMax,
-        outer_loop,
-        is_masked,
-        calc_t,
-        vec_t,
-        /*is_safe_softmax = */ false,
-        is_same_dtype>;
+    if constexpr (is_masked) {
+      using KernelClass = DispatchSoftmaxForwardKernelFunctor<
+          INNER_LOOP,
+          vec_size,
+          SIMD,
+          inscalar_t,
+          outscalar_t,
+          accscalar_t,
+          IndexType,
+          LogSoftMax,
+          outer_loop,
+          is_masked,
+          calc_t,
+          vec_t,
+          /*is_safe_softmax = */ false,
+          is_same_dtype,
+          align_bytes>;
 
     int sub_group_num, global_size_row, local_size_row, range, local_size;
     int max_group_size =
@@ -467,7 +531,7 @@ bool dispatch_softmax_forward_kernel(
             local_size_row,
             local_size);
 
-    if (max_group_size * INNER_LOOP < dim_size) {
+    if (max_group_size * INNER_LOOP < dim_size + vec_size - 1) {
       return false;
     }
 
@@ -505,7 +569,8 @@ bool dispatch_softmax_forward_kernel(
         DummyFunctor,
         vec_t,
         is_safe_softmax,
-        is_same_dtype>;
+        is_same_dtype,
+        align_bytes>;
     int sub_group_num, global_size_row, local_size_row, range, local_size;
     int max_group_size =
         get_wgroup_size<SIMD, vec_size, outer_loop, KernelClass>(
@@ -517,7 +582,7 @@ bool dispatch_softmax_forward_kernel(
             local_size_row,
             local_size);
 
-    if (max_group_size * INNER_LOOP < dim_size) {
+    if (max_group_size * INNER_LOOP < dim_size + vec_size - 1) {
       return false;
     }
 
@@ -1582,7 +1647,6 @@ void spatial_softmax_forward(
   constexpr int max_vec_size = float4_size / sizeof(inscalar_t);
   constexpr int INNER_LOOP = max_vec_size * 2;
 
-  // decide vec_size: max_vec_size or 1
   using vec_t = at::native::memory::aligned_vector<inscalar_t, max_vec_size>;
   constexpr int align_bytes = alignof(vec_t);
   int input_start =
@@ -1618,7 +1682,8 @@ void spatial_softmax_forward(
         /*is_masked = */ false,                                   \
         /*calc_t = */ decltype(nullptr),                          \
         /*is_safe_softmax = */ is_safe_softmax,                   \
-        is_same_dtype>(                                           \
+        is_same_dtype,                                            \
+        align_bytes>(                                             \
         input.const_data_ptr<inscalar_t>(),                       \
         output.mutable_data_ptr<outscalar_t>(),                   \
         dim_size,                                                 \
@@ -1666,45 +1731,23 @@ void spatial_softmax_forward(
     // otherwise, the general path (softmax_forward_kernel) will be selected.
     bool use_slow_path = true;
     if (can_use_32bit_index) {
-      // it assumes vec_size * outer_loop * work_group_size >= dim_size
-
       if (SIMD == SIMD32) {
-        // Ensure input/output tensor are aligned with max_vec_size
-        if (input_start == 0 && output_start == 0 &&
-            dim_size % max_vec_size == 0) {
-          constexpr int outer_loop = INNER_LOOP / max_vec_size;
-          DISPATCH_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ max_vec_size, /*SIMD*/ SIMD32, outer_loop);
-        } else {
-          constexpr int outer_loop = INNER_LOOP;
-          DISPATCH_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ 1, /*SIMD*/ SIMD32, outer_loop);
-        }
+        constexpr int outer_loop = INNER_LOOP / max_vec_size;
+        DISPATCH_SOFTMAX_FORWARD_IMPL(
+            /*vec_size*/ max_vec_size, /*SIMD*/ SIMD32, outer_loop);
       } else {
-        if (input_start == 0 && output_start == 0 &&
-            dim_size % max_vec_size == 0) {
-          if (max_vec_size >= 4 && dim_size <= 4 * SIMD) {
-            // if vec_size >= 4 and dim_size <= 4 * SIMD, take smaller
-            // vec_size and 1 outer_loop
-            constexpr int outer_loop = 1;
-            DISPATCH_SOFTMAX_FORWARD_IMPL(
-                /*vec_size*/ 4, /*SIMD*/ SIMD16, outer_loop);
-          } else if (dim_size <= max_vec_size * SIMD) {
-            // if dim_size <= max_vec_size * SIMD , take 1 outer_loop
-            constexpr int outer_loop = 1;
-            DISPATCH_SOFTMAX_FORWARD_IMPL(
-                /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
-          } else {
-            // SIMD16 will use less register numbers than SIMD32
-            // if the SIMD = SIMD16, then outer_loop will be enlarged 2x
-            constexpr int outer_loop = INNER_LOOP / max_vec_size * 2;
-            DISPATCH_SOFTMAX_FORWARD_IMPL(
-                /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
-          }
-        } else {
-          constexpr int outer_loop = INNER_LOOP * 2;
+        if (max_vec_size >= 4 && dim_size <= 4 * SIMD) {
+          constexpr int outer_loop = 1;
           DISPATCH_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ 1, /*SIMD*/ SIMD16, outer_loop);
+              /*vec_size*/ 4, /*SIMD*/ SIMD16, outer_loop);
+        } else if (dim_size <= max_vec_size * SIMD) {
+          constexpr int outer_loop = 1;
+          DISPATCH_SOFTMAX_FORWARD_IMPL(
+              /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
+        } else {
+          constexpr int outer_loop = INNER_LOOP / max_vec_size * 2;
+          DISPATCH_SOFTMAX_FORWARD_IMPL(
+              /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
         }
       }
     }
@@ -1912,15 +1955,9 @@ Tensor& masked_softmax_forward(
   constexpr int max_vec_size = float4_size / sizeof(scalar_t);
   constexpr int INNER_LOOP = max_vec_size * 2;
 
-  // decide vec_size: max_vec_size or 1
   using vec_t = at::native::memory::aligned_vector<scalar_t, max_vec_size>;
   constexpr int align_bytes = alignof(vec_t);
-  int input_start =
-      ((uint64_t)input.const_data_ptr()) % align_bytes / sizeof(scalar_t);
-  int output_start =
-      ((uint64_t)output.const_data_ptr()) % align_bytes / sizeof(scalar_t);
 
-  // decide indexing range: uint32_t (4GB) or uint64_t (>4GB)
   bool can_use_32bit_index =
       canUse32BitIndexMath(input) && canUse32BitIndexMath(output);
 
@@ -1948,7 +1985,8 @@ Tensor& masked_softmax_forward(
         true,                                                          \
         decltype(input_calc),                                          \
         /*is_safe_softmax = */ false,                                  \
-        true>(                                                         \
+        true,                                                          \
+        align_bytes>(                                                  \
         input.const_data_ptr<scalar_t>(),                              \
         output.mutable_data_ptr<scalar_t>(),                           \
         dim_size,                                                      \
@@ -1967,42 +2005,22 @@ Tensor& masked_softmax_forward(
     auto input_calc = make_input_offset_calculator<2>(iter);
 
     if (SIMD == SIMD32) {
-      // Ensure input/output tensor are aligned with max_vec_size
-      if (input_start == 0 && output_start == 0 &&
-          dim_size % max_vec_size == 0) {
-        constexpr int outer_loop = INNER_LOOP / max_vec_size;
-        DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-            /*vec_size*/ max_vec_size, /*SIMD*/ SIMD32, outer_loop);
-      } else {
-        constexpr int outer_loop = INNER_LOOP;
-        DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-            /*vec_size*/ 1, /*SIMD*/ SIMD32, outer_loop);
-      }
+      constexpr int outer_loop = INNER_LOOP / max_vec_size;
+      DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
+          /*vec_size*/ max_vec_size, /*SIMD*/ SIMD32, outer_loop);
     } else {
-      if (input_start == 0 && output_start == 0 &&
-          dim_size % max_vec_size == 0) {
-        if (max_vec_size >= 4 && dim_size <= 4 * SIMD) {
-          // if vec_size >= 4 and dim_size <= 4 * SIMD, take smaller vec_size
-          // and 1 outer_loop
-          constexpr int outer_loop = 1;
-          DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ 4, /*SIMD*/ SIMD16, outer_loop);
-        } else if (dim_size <= max_vec_size * SIMD) {
-          // if dim_size <= max_vec_size * SIMD , take 1 outer_loop
-          constexpr int outer_loop = 1;
-          DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
-        } else {
-          // SIMD16 will use less register numbers than SIMD32
-          // if the SIMD = SIMD16, then outer_loop will be enlarged 2x
-          constexpr int outer_loop = INNER_LOOP / max_vec_size * 2;
-          DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-              /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
-        }
-      } else {
-        constexpr int outer_loop = INNER_LOOP * 2;
+      if (max_vec_size >= 4 && dim_size <= 4 * SIMD) {
+        constexpr int outer_loop = 1;
         DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
-            /*vec_size*/ 1, /*SIMD*/ SIMD16, outer_loop);
+            /*vec_size*/ 4, /*SIMD*/ SIMD16, outer_loop);
+      } else if (dim_size <= max_vec_size * SIMD) {
+        constexpr int outer_loop = 1;
+        DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
+            /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
+      } else {
+        constexpr int outer_loop = INNER_LOOP / max_vec_size * 2;
+        DISPATCH_MASK_SOFTMAX_FORWARD_IMPL(
+            /*vec_size*/ max_vec_size, /*SIMD*/ SIMD16, outer_loop);
       }
     }
   }
