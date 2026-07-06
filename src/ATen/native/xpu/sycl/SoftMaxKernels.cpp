@@ -273,16 +273,16 @@ struct DispatchSoftmaxForwardKernelFunctor
         max_value = std::max(max_value, accscalar_t(reg_in[i][j]));
       }
     }
-    if (local_size_ > 1) {
-      softmax_group_reduce<SIMD, accscalar_t>(
-          item,
-          lid_row,
-          sub_group_num_,
-          max_value,
-          std::numeric_limits<accscalar_t>::lowest(),
-          local_max_,
-          [](accscalar_t a, accscalar_t b) { return std::max(a, b); });
-    }
+    // if (local_size_ > 1) {
+    //   softmax_group_reduce<SIMD, accscalar_t>(
+    //       item,
+    //       lid_row,
+    //       sub_group_num_,
+    //       max_value,
+    //       std::numeric_limits<accscalar_t>::lowest(),
+    //       local_max_,
+    //       [](accscalar_t a, accscalar_t b) { return std::max(a, b); });
+    // }
 
     // get sum value
     accscalar_t sum_value = 0;
@@ -295,16 +295,16 @@ struct DispatchSoftmaxForwardKernelFunctor
         sum_value += sycl::exp(reg_in[i][j] - max_value);
       }
     }
-    if (local_size_ > 1) {
-      softmax_group_reduce<SIMD, accscalar_t>(
-          item,
-          lid_row,
-          sub_group_num_,
-          sum_value,
-          accscalar_t(0),
-          local_sum_,
-          [](accscalar_t a, accscalar_t b) { return a + b; });
-    }
+    // if (local_size_ > 1) {
+    //   softmax_group_reduce<SIMD, accscalar_t>(
+    //       item,
+    //       lid_row,
+    //       sub_group_num_,
+    //       sum_value,
+    //       accscalar_t(0),
+    //       local_sum_,
+    //       [](accscalar_t a, accscalar_t b) { return a + b; });
+    // }
     if constexpr (LogSoftMax)
       sum_value = sycl::log(sum_value);
     else if (sum_value != 0)
@@ -1009,16 +1009,16 @@ struct DispatchSoftmaxBackwardKernelFunctor
         }
       }
     }
-    if (local_size_ > 1) {
-      softmax_group_reduce<SIMD, accscalar_t>(
-          item,
-          lid_row,
-          sub_group_num_,
-          sum_value,
-          accscalar_t(0),
-          local_sum_,
-          [](accscalar_t a, accscalar_t b) { return a + b; });
-    }
+    // if (local_size_ > 1) {
+    //   softmax_group_reduce<SIMD, accscalar_t>(
+    //       item,
+    //       lid_row,
+    //       sub_group_num_,
+    //       sum_value,
+    //       accscalar_t(0),
+    //       local_sum_,
+    //       [](accscalar_t a, accscalar_t b) { return a + b; });
+    // }
     // update result
 #pragma unroll(NUM)
     for (int i = 0; i < NUM; ++i) {
