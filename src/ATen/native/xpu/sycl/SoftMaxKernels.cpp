@@ -224,7 +224,7 @@ template <
     typename vec_t,
     bool is_safe_softmax,
     bool is_same_dtype,
-    int align_bytes>
+    int align_bytes = alignof(vec_t)>
 struct DispatchSoftmaxForwardKernelFunctor
     : public __SYCL_KER_CONFIG_CONVENTION__ {
   SYCL_REQD_SUB_GROUP_SIZE(SIMD) void operator()(sycl::nd_item<1> item) const {
@@ -517,8 +517,7 @@ bool dispatch_softmax_forward_kernel(
           calc_t,
           vec_t,
           /*is_safe_softmax = */ false,
-          is_same_dtype,
-          align_bytes>;
+          is_same_dtype>;
 
     int sub_group_num, global_size_row, local_size_row, range, local_size;
     int max_group_size =
@@ -569,8 +568,7 @@ bool dispatch_softmax_forward_kernel(
         DummyFunctor,
         vec_t,
         is_safe_softmax,
-        is_same_dtype,
-        align_bytes>;
+        is_same_dtype>;
     int sub_group_num, global_size_row, local_size_row, range, local_size;
     int max_group_size =
         get_wgroup_size<SIMD, vec_size, outer_loop, KernelClass>(
@@ -1682,8 +1680,7 @@ void spatial_softmax_forward(
         /*is_masked = */ false,                                   \
         /*calc_t = */ decltype(nullptr),                          \
         /*is_safe_softmax = */ is_safe_softmax,                   \
-        is_same_dtype,                                            \
-        align_bytes>(                                             \
+        is_same_dtype>(                                           \
         input.const_data_ptr<inscalar_t>(),                       \
         output.mutable_data_ptr<outscalar_t>(),                   \
         dim_size,                                                 \
@@ -1955,9 +1952,6 @@ Tensor& masked_softmax_forward(
   constexpr int max_vec_size = float4_size / sizeof(scalar_t);
   constexpr int INNER_LOOP = max_vec_size * 2;
 
-  using vec_t = at::native::memory::aligned_vector<scalar_t, max_vec_size>;
-  constexpr int align_bytes = alignof(vec_t);
-
   bool can_use_32bit_index =
       canUse32BitIndexMath(input) && canUse32BitIndexMath(output);
 
@@ -1985,8 +1979,7 @@ Tensor& masked_softmax_forward(
         true,                                                          \
         decltype(input_calc),                                          \
         /*is_safe_softmax = */ false,                                  \
-        true,                                                          \
-        align_bytes>(                                                  \
+        true>(                                                         \
         input.const_data_ptr<scalar_t>(),                              \
         output.mutable_data_ptr<scalar_t>(),                           \
         dim_size,                                                      \
