@@ -54,11 +54,13 @@ static inline void softmax_group_reduce(
 
   // dynamic get SIMD width result in big performance drop
   // uint32_t SIMD = sg.get_local_range()[0];
-#pragma unroll
-  for (int i = 1; i < SIMD; i <<= 1) {
-    val = bin_op(
-        val, static_cast<accscalar_t>(sycl::shift_group_left(sg, val, i)));
-  }
+// #pragma unroll
+//   for (int i = 1; i < SIMD; i <<= 1) {
+//     val = bin_op(
+//         val, static_cast<accscalar_t>(sycl::shift_group_left(sg, val, i)));
+//   }
+  val = sycl::reduce_over_group(sg, val, bin_op);
+        
   if (sub_group_num == 1) {
     val = sycl::group_broadcast(sg, val, 0);
     return;
@@ -83,13 +85,14 @@ static inline void softmax_group_reduce(
     for (int i = sg_local_id + SIMD; i < sub_group_num; i += SIMD) {
       val = bin_op(val, static_cast<accscalar_t>(local_data[lid_row][i]));
     }
-#pragma unroll
-    for (int i = 1; i < SIMD; i <<= 1) {
-      val = bin_op(
-          val, static_cast<accscalar_t>(sycl::shift_group_left(sg, val, i)));
-      if (i >= ((sub_group_num + 1) >> 1))
-        break;
-    }
+// #pragma unroll
+//     for (int i = 1; i < SIMD; i <<= 1) {
+//       val = bin_op(
+//           val, static_cast<accscalar_t>(sycl::shift_group_left(sg, val, i)));
+//       if (i >= ((sub_group_num + 1) >> 1))
+//         break;
+//     }
+    val = sycl::reduce_over_group(sg, val, bin_op);
 
     // the 0th WI (the 0th WI in the 0th sub_group) generate the final result
     if (sg_local_id == 0) {
@@ -273,16 +276,17 @@ struct DispatchSoftmaxForwardKernelFunctor
         max_value = std::max(max_value, accscalar_t(reg_in[i][j]));
       }
     }
-    // if (local_size_ > 1) {
-    //   softmax_group_reduce<SIMD, accscalar_t>(
-    //       item,
-    //       lid_row,
-    //       sub_group_num_,
-    //       max_value,
-    //       std::numeric_limits<accscalar_t>::lowest(),
-    //       local_max_,
-    //       [](accscalar_t a, accscalar_t b) { return std::max(a, b); });
-    // }
+    if (local_size_ > 1) {
+      softmax_group_reduce<SIMD, accscalar_t>(
+          item,
+          lid_row,
+          sub_group_num_,
+          max_value,
+          std::numeric_limits<accscalar_t>::lowest(),
+          local_max_,
+          // [](accscalar_t a, accscalar_t b) { return std::max(a, b); })
+          sycl::maximum<accscalar_t>());
+    }
 
     // get sum value
     accscalar_t sum_value = 0;
@@ -295,16 +299,17 @@ struct DispatchSoftmaxForwardKernelFunctor
         sum_value += sycl::exp(reg_in[i][j] - max_value);
       }
     }
-    // if (local_size_ > 1) {
-    //   softmax_group_reduce<SIMD, accscalar_t>(
-    //       item,
-    //       lid_row,
-    //       sub_group_num_,
-    //       sum_value,
-    //       accscalar_t(0),
-    //       local_sum_,
-    //       [](accscalar_t a, accscalar_t b) { return a + b; });
-    // }
+    if (local_size_ > 1) {
+      softmax_group_reduce<SIMD, accscalar_t>(
+          item,
+          lid_row,
+          sub_group_num_,
+          sum_value,
+          accscalar_t(0),
+          local_sum_,
+          // [](accscalar_t a, accscalar_t b) { return a + b; })
+          sycl::plus<accscalar_t>());
+    }
     if constexpr (LogSoftMax)
       sum_value = sycl::log(sum_value);
     else if (sum_value != 0)
@@ -1009,16 +1014,17 @@ struct DispatchSoftmaxBackwardKernelFunctor
         }
       }
     }
-    // if (local_size_ > 1) {
-    //   softmax_group_reduce<SIMD, accscalar_t>(
-    //       item,
-    //       lid_row,
-    //       sub_group_num_,
-    //       sum_value,
-    //       accscalar_t(0),
-    //       local_sum_,
-    //       [](accscalar_t a, accscalar_t b) { return a + b; });
-    // }
+    if (local_size_ > 1) {
+      softmax_group_reduce<SIMD, accscalar_t>(
+          item,
+          lid_row,
+          sub_group_num_,
+          sum_value,
+          accscalar_t(0),
+          local_sum_,
+          // [](accscalar_t a, accscalar_t b) { return a + b; })
+          sycl::plus<accscalar_t>());
+    }
     // update result
 #pragma unroll(NUM)
     for (int i = 0; i < NUM; ++i) {
